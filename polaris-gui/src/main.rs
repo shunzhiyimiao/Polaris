@@ -41,20 +41,70 @@ struct AiProposal {
     changes: Vec<AiChange>,
 }
 
-/// 一次 AI 改写调用的结果（后台线程经 channel 送回 UI 线程）。
+/// 一次 AI 请求的种类与快照（发起时的旧文随请求走：收货时用来判断段落是否已被人改过）。
+enum AiRequest {
+    /// 单段改写。
+    Single { node: NodeId, old: String },
+    /// 全文清理：请求时全部可编辑段的 (id, 旧文) 快照。
+    CleanAll { olds: Vec<(NodeId, String)> },
+}
+
+/// 一次 AI 调用的结果（后台线程经 channel 送回 UI 线程；result = 模型**原始文本**，解析在 UI 线程做）。
 struct AiReply {
-    node: NodeId,
-    /// 发起请求时的原文：收货时若段落已被人改过（请求在路上要数秒），提案过期作废。
-    old: String,
+    request: AiRequest,
     result: Result<String, String>,
 }
 
-/// 改写提示词。**纯函数**，便于单测锚定关键约束。
+/// 单段改写提示词。**纯函数**，便于单测锚定关键约束。
 fn ai_rewrite_prompt(text: &str) -> String {
     format!(
         "你是文档润色助手。改写下面这段话，使其更通顺、专业、简洁；保持原意、保持中文、\
          保留专有名词与数字；只输出改写后的正文，不要任何解释、前后缀、引号或 markdown。\n\n原文：\n{text}"
     )
+}
+
+/// 全文清理提示词：段落带 id 列出，要求模型只回「需要改的段」的 JSON 数组。**纯函数**。
+fn ai_clean_prompt(segments: &[(NodeId, String)]) -> String {
+    let mut body = String::new();
+    for (id, text) in segments {
+        body.push_str(&format!("[{}] {}\n", id.0, text));
+    }
+    format!(
+        "你是文档清理助手。下面是一篇文档的段落列表，每段开头方括号里是它的 id。\n\
+         任务：找出需要清理的段落——删除明显的测试杂质（如插在正文里的无意义数字串 1111/2222/333333 等）、\
+         修正明显的误植；其余内容**原样保留**，不要做风格性改写，不要动没有问题的段落。\n\
+         只输出一个 JSON 数组，元素形如 {{\"id\": \"...\", \"new\": \"...\"}}，**只包含需要修改的段落**；\
+         没有要改的就输出 []。不要任何解释、markdown 代码栅栏或其它文本。\n\n{body}"
+    )
+}
+
+/// 解析「全文清理」的模型回复（JSON 数组 `[{id,new}]`）成改动列表。
+/// 只认请求里存在的 id；new 与请求时旧文相同的丢弃。返回 (改动列表, 丢弃数)。**纯函数**。
+fn parse_clean_reply(raw: &str, olds: &[(NodeId, String)]) -> Result<(Vec<AiChange>, usize), String> {
+    let cleaned = parse_ai_reply(raw);
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(&cleaned).map_err(|e| format!("模型回复不是合法 JSON 数组: {e}"))?;
+    let old_of: HashMap<&str, &str> = olds.iter().map(|(n, t)| (n.0.as_str(), t.as_str())).collect();
+    let mut changes = Vec::new();
+    let mut dropped = 0usize;
+    for it in &items {
+        let (Some(id), Some(new)) =
+            (it.get("id").and_then(|v| v.as_str()), it.get("new").and_then(|v| v.as_str()))
+        else {
+            dropped += 1;
+            continue;
+        };
+        match old_of.get(id) {
+            Some(old) if *old != new => changes.push(AiChange {
+                node: NodeId(id.to_string()),
+                old: old.to_string(),
+                new: new.to_string(),
+                selected: true,
+            }),
+            _ => dropped += 1, // 不认识的 id / 无实质变化
+        }
+    }
+    Ok((changes, dropped))
 }
 
 /// 清洗模型回复：去首尾空白、剥 markdown 代码栅栏、剥成对的首尾引号（模型偶尔套壳）。**纯函数**。
@@ -77,9 +127,10 @@ fn parse_ai_reply(reply: &str) -> String {
 }
 
 /// 真 AI 源：子进程调本机 `claude -p`（复用已认证的 Claude Code CLI，零新依赖——与 officecli 同模式）。
-/// 改写是轻任务，用快模型；阻塞数秒，**调用方必须放后台线程**。
+/// 提示词走 stdin，返回模型**原始文本**（解析交给调用方的纯函数）。
+/// 阻塞数秒到一两分钟，**调用方必须放后台线程**。
 /// 实测：认证失败 exit=1 且错误走 stdout——所以失败信息把 stdout 也带上。
-fn claude_rewrite(text: &str) -> Result<String, String> {
+fn claude_prompt(prompt: &str) -> Result<String, String> {
     let mut child = Command::new("claude")
         .args(["-p", "--model", "haiku"])
         .stdin(Stdio::piped())
@@ -91,7 +142,7 @@ fn claude_rewrite(text: &str) -> Result<String, String> {
         .stdin
         .take()
         .expect("piped stdin")
-        .write_all(ai_rewrite_prompt(text).as_bytes())
+        .write_all(prompt.as_bytes())
         .map_err(|e| format!("写入 claude stdin 失败: {e}"))?;
     let out = child.wait_with_output().map_err(|e| format!("等待 claude 失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -99,11 +150,7 @@ fn claude_rewrite(text: &str) -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("claude 调用失败: {} {}", stdout.trim(), stderr.trim()));
     }
-    let cleaned = parse_ai_reply(&stdout);
-    if cleaned.is_empty() {
-        return Err("模型返回为空".to_string());
-    }
-    Ok(cleaned)
+    Ok(stdout.into_owned())
 }
 
 /// 文档序前序遍历，收集非空节点为块（与 renderer 同构，但产数据）。
@@ -326,30 +373,90 @@ impl PolarisApp {
         self.status = format!("AI 改写中…（{}，约十秒）", node.0);
         let node = node.clone();
         std::thread::spawn(move || {
-            let result = claude_rewrite(&old);
-            let _ = tx.send(AiReply { node, old, result });
+            let result = claude_prompt(&ai_rewrite_prompt(&old));
+            let _ = tx.send(AiReply { request: AiRequest::Single { node, old }, result });
         });
     }
 
-    /// 收 AI 结果：成功且有实质改动 → **追加**进待 review 提案（同节点的旧条目被替换）——
-    /// 可以连续对几个段落发起请求，攒一批一起 review。无改动/出错/段落已被人改过 → 只报状态。
+    /// 全文清理的目标段：全部可编辑块（Opaque 排除），超上限截断（先妥协，明示）。
+    fn clean_targets(&self) -> (Vec<(NodeId, String)>, usize) {
+        const MAX_SEGMENTS: usize = 100;
+        let all: Vec<(NodeId, String)> = document_blocks(&self.model)
+            .into_iter()
+            .filter(|b| b.kind != NodeKind::Opaque)
+            .map(|b| (b.node, b.text))
+            .collect();
+        let truncated = all.len().saturating_sub(MAX_SEGMENTS);
+        (all.into_iter().take(MAX_SEGMENTS).collect(), truncated)
+    }
+
+    /// 「AI 清理全文」：全部可编辑段打包给真模型，要求只回需要改的段（JSON）。后台线程同单段。
+    fn start_ai_clean_all(&mut self) {
+        if self.ai_rx.is_some() {
+            self.status = "已有一个 AI 请求在路上，等它回来".to_string();
+            return;
+        }
+        let (olds, truncated) = self.clean_targets();
+        if olds.is_empty() {
+            self.status = "没有可清理的段落".to_string();
+            return;
+        }
+        let warn = if truncated > 0 { format!("（超长截断，{truncated} 段未送审）") } else { String::new() };
+        self.status = format!("AI 清理全文中…（{} 段，可能要一两分钟）{warn}", olds.len());
+        let (tx, rx) = mpsc::channel();
+        self.ai_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = claude_prompt(&ai_clean_prompt(&olds));
+            let _ = tx.send(AiReply { request: AiRequest::CleanAll { olds }, result });
+        });
+    }
+
+    /// 把一条改动并进待 review 提案（同节点替换旧条目），返回提案当前总条数。
+    fn merge_change(&mut self, change: AiChange) -> usize {
+        let proposal = self.pending_ai.get_or_insert_with(|| AiProposal { changes: Vec::new() });
+        proposal.changes.retain(|c| c.node != change.node);
+        proposal.changes.push(change);
+        proposal.changes.len()
+    }
+
+    /// 收 AI 结果（解析全在这里的纯函数链上做）：有实质改动 → 并进待 review 提案；
+    /// 无改动/出错/段落已被人改过 → 只报状态。
     fn receive_ai_result(&mut self, reply: AiReply) {
-        match reply.result {
-            Err(e) => self.status = format!("AI 调用失败: {e}"),
-            Ok(new) => {
-                if self.model.get_text(&reply.node) != Some(reply.old.as_str()) {
-                    self.status = format!("{} 在 AI 思考期间被改过，该条作废", reply.node.0);
-                } else if new == reply.old {
-                    self.status = format!("AI 对 {} 无改动建议", reply.node.0);
+        let raw = match reply.result {
+            Err(e) => {
+                self.status = format!("AI 调用失败: {e}");
+                return;
+            }
+            Ok(raw) => raw,
+        };
+        match reply.request {
+            AiRequest::Single { node, old } => {
+                let new = parse_ai_reply(&raw);
+                if new.is_empty() {
+                    self.status = "模型返回为空".to_string();
+                } else if self.model.get_text(&node) != Some(old.as_str()) {
+                    self.status = format!("{} 在 AI 思考期间被改过，该条作废", node.0);
+                } else if new == old {
+                    self.status = format!("AI 对 {} 无改动建议", node.0);
                 } else {
-                    let change = AiChange { node: reply.node, old: reply.old, new, selected: true };
-                    let proposal = self.pending_ai.get_or_insert_with(|| AiProposal { changes: Vec::new() });
-                    proposal.changes.retain(|c| c.node != change.node); // 同节点新提案替换旧的
-                    proposal.changes.push(change);
-                    self.status =
-                        format!("AI 提案待 review：共 {} 条（在对照面板勾选接受/拒绝）", proposal.changes.len());
+                    let n = self.merge_change(AiChange { node, old, new, selected: true });
+                    self.status = format!("AI 提案待 review：共 {n} 条（在对照面板勾选接受/拒绝）");
                 }
             }
+            AiRequest::CleanAll { olds } => match parse_clean_reply(&raw, &olds) {
+                Err(e) => self.status = format!("AI 清理回复解析失败: {e}"),
+                Ok((changes, dropped)) if changes.is_empty() => {
+                    self.status = format!("AI 认为全文无需清理（丢弃无效项 {dropped} 条）");
+                }
+                Ok((changes, dropped)) => {
+                    let mut n = 0;
+                    for c in changes {
+                        n = self.merge_change(c);
+                    }
+                    let warn = if dropped > 0 { format!("；丢弃无效项 {dropped} 条") } else { String::new() };
+                    self.status = format!("AI 清理建议待 review：共 {n} 条{warn}");
+                }
+            },
         }
     }
 
@@ -590,6 +697,7 @@ impl eframe::App for PolarisApp {
         let mut do_open: Option<String> = None;
         let mut do_save = false;
         let mut do_pick = false;
+        let mut do_ai_clean = false;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("📂 打开…").clicked() {
@@ -603,6 +711,9 @@ impl eframe::App for PolarisApp {
                 }
                 if ui.button("🕘 历史").clicked() {
                     self.show_history = !self.show_history;
+                }
+                if ui.button("🤖 清理全文").clicked() {
+                    do_ai_clean = true;
                 }
             });
             ui.horizontal(|ui| {
@@ -741,9 +852,11 @@ impl eframe::App for PolarisApp {
             })
             .unwrap_or_default();
         if let Some(p) = &mut self.pending_ai {
+            // 右上锚定：让开左侧的 x/+/AI 操作列（真机验证发现默认位置会盖住按钮）。
             egui::Window::new("AI 改写提案（需 review）")
                 .collapsible(false)
                 .default_width(460.0)
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 64.0))
                 .show(ctx, |ui| {
                     ui.label(format!("{} 条改动建议，勾选要接受的：", p.changes.len()));
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -784,6 +897,9 @@ impl eframe::App for PolarisApp {
         }
         if let Some(node) = pending_ai_request {
             self.start_ai_request(&node);
+        }
+        if do_ai_clean {
+            self.start_ai_clean_all();
         }
         match ai_decision {
             Some(true) => self.accept_ai(),
@@ -1061,9 +1177,12 @@ mod tests {
         (app, ids.into_iter().next().unwrap())
     }
 
-    /// 测试小工具：伪造一条成功的 AI 回包。
+    /// 测试小工具：伪造一条成功的单段 AI 回包。
     fn ok_reply(node: &NodeId, old: &str, new: &str) -> AiReply {
-        AiReply { node: node.clone(), old: old.to_string(), result: Ok(new.to_string()) }
+        AiReply {
+            request: AiRequest::Single { node: node.clone(), old: old.to_string() },
+            result: Ok(new.to_string()),
+        }
     }
 
     #[test]
@@ -1152,8 +1271,7 @@ mod tests {
     fn ai_reply_reject_leaves_model_untouched() {
         let (mut app, node) = app_with_paragraph("改我呀");
         app.receive_ai_result(AiReply {
-            node: node.clone(),
-            old: "改我呀".to_string(),
+            request: AiRequest::Single { node: node.clone(), old: "改我呀".to_string() },
             result: Ok("改好了。".to_string()),
         });
         assert!(app.pending_ai.is_some());
@@ -1169,8 +1287,7 @@ mod tests {
         let (mut app, node) = app_with_paragraph("原文");
         app.commit_edit(&node, "人在 AI 思考时改了。").unwrap();
         app.receive_ai_result(AiReply {
-            node: node.clone(),
-            old: "原文".to_string(), // 请求发出时的旧文
+            request: AiRequest::Single { node: node.clone(), old: "原文".to_string() }, // 请求发出时的旧文
             result: Ok("AI 的改写。".to_string()),
         });
         assert!(app.pending_ai.is_none());
@@ -1183,8 +1300,7 @@ mod tests {
         // 提案已挂出，接受前人又改了 → accept 时作废（Step 17 既有防线，原样有效）
         let (mut app, node) = app_with_paragraph("原文");
         app.receive_ai_result(AiReply {
-            node: node.clone(),
-            old: "原文".to_string(),
+            request: AiRequest::Single { node: node.clone(), old: "原文".to_string() },
             result: Ok("AI 的改写。".to_string()),
         });
         app.commit_edit(&node, "人又改了一版。").unwrap();
@@ -1198,21 +1314,124 @@ mod tests {
     fn ai_reply_no_change_or_error_only_sets_status() {
         let (mut app, node) = app_with_paragraph("已经很好。");
         app.receive_ai_result(AiReply {
-            node: node.clone(),
-            old: "已经很好。".to_string(),
+            request: AiRequest::Single { node: node.clone(), old: "已经很好。".to_string() },
             result: Ok("已经很好。".to_string()), // 模型没改
         });
         assert!(app.pending_ai.is_none());
         assert!(app.status.contains("无改动建议"));
 
         app.receive_ai_result(AiReply {
-            node: node.clone(),
-            old: "已经很好。".to_string(),
+            request: AiRequest::Single { node: node.clone(), old: "已经很好。".to_string() },
             result: Err("Not logged in".to_string()),
         });
         assert!(app.pending_ai.is_none());
         assert!(app.status.contains("AI 调用失败"));
         assert_eq!(app.model.get_text(&node), Some("已经很好。")); // 全程一字未动
+    }
+
+    // ── Step 20：全文 AI 清理（JSON 多段提案进 Step 19 通道）──
+
+    #[test]
+    fn ai_clean_prompt_lists_segments_with_ids_and_constraints() {
+        let segs = vec![
+            (NodeId("docx:0".to_string()), "标题1111".to_string()),
+            (NodeId("docx:3".to_string()), "正文".to_string()),
+        ];
+        let p = ai_clean_prompt(&segs);
+        assert!(p.contains("[docx:0] 标题1111"));
+        assert!(p.contains("[docx:3] 正文"));
+        assert!(p.contains("JSON 数组"));
+        assert!(p.contains("只包含需要修改的段落"));
+    }
+
+    #[test]
+    fn parse_clean_reply_filters_unknown_ids_and_no_ops() {
+        let olds = vec![
+            (NodeId("docx:0".to_string()), "标题1111".to_string()),
+            (NodeId("docx:1".to_string()), "干净段".to_string()),
+        ];
+        // 一条有效；一条 id 不认识；一条 new==old（无实质变化）；一条缺字段
+        let raw = "```json\n[\n  {\"id\": \"docx:0\", \"new\": \"标题\"},\n  {\"id\": \"docx:9\", \"new\": \"幻觉段\"},\n  {\"id\": \"docx:1\", \"new\": \"干净段\"},\n  {\"id\": \"docx:1\"}\n]\n```";
+        let (changes, dropped) = parse_clean_reply(raw, &olds).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].node, NodeId("docx:0".to_string()));
+        assert_eq!(changes[0].old, "标题1111");
+        assert_eq!(changes[0].new, "标题");
+        assert_eq!(dropped, 3);
+
+        assert!(parse_clean_reply("这不是JSON", &olds).is_err());
+        assert_eq!(parse_clean_reply("[]", &olds).unwrap().0.len(), 0);
+    }
+
+    #[test]
+    fn clean_all_reply_merges_into_review_channel_and_commits_atomically() {
+        let (mut app, ids) = app_with_paragraphs(&["标题1111", "干净段", "正文2222"]);
+        let olds: Vec<(NodeId, String)> = vec![
+            (ids[0].clone(), "标题1111".to_string()),
+            (ids[1].clone(), "干净段".to_string()),
+            (ids[2].clone(), "正文2222".to_string()),
+        ];
+        app.receive_ai_result(AiReply {
+            request: AiRequest::CleanAll { olds },
+            result: Ok(r#"[{"id":"docx:0","new":"标题"},{"id":"docx:2","new":"正文"}]"#.to_string()),
+        });
+        let p = app.pending_ai.as_ref().expect("应有提案");
+        assert_eq!(p.changes.len(), 2); // 只有需要改的段
+        assert!(app.status.contains("共 2 条"));
+
+        app.accept_ai(); // 走 Step 19 同一条通道：一个 PatchSet 原子提交
+        assert_eq!(app.model.get_text(&ids[0]), Some("标题"));
+        assert_eq!(app.model.get_text(&ids[1]), Some("干净段")); // 没被建议的段不动
+        assert_eq!(app.model.get_text(&ids[2]), Some("正文"));
+        assert_eq!(app.undo_stack.len(), 1);
+        app.undo_last(); // 一次撤销整组回滚
+        assert_eq!(app.model.get_text(&ids[0]), Some("标题1111"));
+        assert_eq!(app.model.get_text(&ids[2]), Some("正文2222"));
+    }
+
+    #[test]
+    fn clean_all_bad_json_or_empty_only_sets_status() {
+        let (mut app, ids) = app_with_paragraphs(&["甲"]);
+        let olds = vec![(ids[0].clone(), "甲".to_string())];
+        app.receive_ai_result(AiReply {
+            request: AiRequest::CleanAll { olds: olds.clone() },
+            result: Ok("模型抽风不回JSON".to_string()),
+        });
+        assert!(app.pending_ai.is_none());
+        assert!(app.status.contains("解析失败"));
+
+        app.receive_ai_result(AiReply {
+            request: AiRequest::CleanAll { olds },
+            result: Ok("[]".to_string()),
+        });
+        assert!(app.pending_ai.is_none());
+        assert!(app.status.contains("无需清理"));
+        assert_eq!(app.model.get_text(&ids[0]), Some("甲")); // 全程未动
+    }
+
+    #[test]
+    fn clean_targets_excludes_opaque_and_caps_at_limit() {
+        // Opaque 排除
+        let mut app = PolarisApp::new();
+        let backend = FakeBackend::new(vec![
+            DocxBlock::Paragraph { text: "甲".to_string(), para_id: Some("AA".to_string()) },
+            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None },
+            DocxBlock::Paragraph { text: "乙".to_string(), para_id: Some("BB".to_string()) },
+        ]);
+        app.load_from_backend(&backend, "x.docx").unwrap();
+        let (targets, truncated) = app.clean_targets();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|(_, t)| t == "甲" || t == "乙"));
+        assert_eq!(truncated, 0);
+
+        // 超过 100 段截断并报数
+        let many: Vec<DocxBlock> = (0..105)
+            .map(|i| DocxBlock::Paragraph { text: format!("段{i}"), para_id: Some(format!("P{i}")) })
+            .collect();
+        app.load_from_backend(&FakeBackend::new(many), "y.docx").unwrap();
+        let (targets, truncated) = app.clean_targets();
+        assert_eq!(targets.len(), 100);
+        assert_eq!(truncated, 5);
     }
 
     #[test]

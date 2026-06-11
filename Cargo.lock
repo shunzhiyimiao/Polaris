@@ -2588,6 +2588,7 @@ dependencies = [
  "image",
  "polaris-docx",
  "rfd",
+ "serde_json",
 ]
 
 [[package]]

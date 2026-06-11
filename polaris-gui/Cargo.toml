@@ -15,3 +15,5 @@ chrono = "0.4"
 # image 必须显式依赖并开格式 feature——egui_extras 默认不开任何解码格式（feature 合并）。
 egui_extras = { version = "0.29", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# serde_json（全文 AI 清理引入）：模型按约定返回 JSON 数组 [{id,new}]，手写解析不可靠。
+serde_json = "1"
