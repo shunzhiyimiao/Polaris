@@ -27,12 +27,18 @@ struct ViewBlock {
     text: String,
 }
 
-/// 一条等待 review 的 AI 改写提案（旧文/新文对照）。提案**不碰 model**；
-/// 接受时按当下模型重建 patch（段落若已被人改过则作废）。
-struct AiProposal {
+/// 一条 AI 改动建议（旧文/新文对照 + 勾选状态）。
+struct AiChange {
     node: NodeId,
     old: String,
     new: String,
+    selected: bool,
+}
+
+/// 等待 review 的 AI 提案：**多条**改动，逐条勾选，接受的合成一个 PatchSet 原子提交
+/// （= 一个撤销单位）。提案本身**不碰 model**；某条的段落被人改过 → 该条失效不可勾。
+struct AiProposal {
+    changes: Vec<AiChange>,
 }
 
 /// 一次 AI 改写调用的结果（后台线程经 channel 送回 UI 线程）。
@@ -325,56 +331,81 @@ impl PolarisApp {
         });
     }
 
-    /// 收 AI 结果：成功且有实质改动 → 进待 review 区；无改动/出错/段落已被人改过 → 只报状态。
+    /// 收 AI 结果：成功且有实质改动 → **追加**进待 review 提案（同节点的旧条目被替换）——
+    /// 可以连续对几个段落发起请求，攒一批一起 review。无改动/出错/段落已被人改过 → 只报状态。
     fn receive_ai_result(&mut self, reply: AiReply) {
         match reply.result {
             Err(e) => self.status = format!("AI 调用失败: {e}"),
             Ok(new) => {
                 if self.model.get_text(&reply.node) != Some(reply.old.as_str()) {
-                    self.status = format!("{} 在 AI 思考期间被改过，提案作废", reply.node.0);
+                    self.status = format!("{} 在 AI 思考期间被改过，该条作废", reply.node.0);
                 } else if new == reply.old {
                     self.status = format!("AI 对 {} 无改动建议", reply.node.0);
                 } else {
-                    self.status = format!("AI 提案待 review：{}（在对照面板接受/拒绝）", reply.node.0);
-                    self.pending_ai = Some(AiProposal { node: reply.node, old: reply.old, new });
+                    let change = AiChange { node: reply.node, old: reply.old, new, selected: true };
+                    let proposal = self.pending_ai.get_or_insert_with(|| AiProposal { changes: Vec::new() });
+                    proposal.changes.retain(|c| c.node != change.node); // 同节点新提案替换旧的
+                    proposal.changes.push(change);
+                    self.status =
+                        format!("AI 提案待 review：共 {} 条（在对照面板勾选接受/拒绝）", proposal.changes.len());
                 }
             }
         }
     }
 
-    /// 接受提案：构造 **AI 来源** patch → `approve_ai`（review 放行）→ 原子 commit → 入撤销栈。
-    /// 提案期间段落被人改过 → 作废不提交（提案是针对旧文的）。
+    /// 某条提案是否仍有效：段落当前文本必须仍等于提案时的旧文（被人改过 → 失效）。
+    fn change_valid(&self, c: &AiChange) -> bool {
+        self.model.get_text(&c.node) == Some(c.old.as_str())
+    }
+
+    /// 接受勾选项：有效且勾选的改动合成**一个 AI 来源 PatchSet** → `approve_ai`（review 放行）→
+    /// **一次原子 commit = 一个撤销单位**。失效/未勾的不进组；组空则不提交。
     fn accept_ai(&mut self) {
         let Some(p) = self.pending_ai.take() else { return };
-        if self.model.get_text(&p.node) != Some(p.old.as_str()) {
-            self.status = format!("{} 在提案后被改过，AI 提案作废", p.node.0);
+        let total = p.changes.len();
+        let source_map = render_html(&self.model).source_map;
+        let mut patches = Vec::new();
+        let mut stale = 0usize;
+        for (i, c) in p.changes.iter().enumerate() {
+            if !c.selected {
+                continue;
+            }
+            if !self.change_valid(c) {
+                stale += 1;
+                continue;
+            }
+            let Some(span) = source_map.span_for(&c.node) else {
+                stale += 1;
+                continue;
+            };
+            patches.push(Patch::ai(
+                &format!("ai-{i}"),
+                Target::Node(c.node.clone()),
+                Op::SetSpan { range: span.range, text: c.new.clone() },
+            ));
+        }
+        if patches.is_empty() {
+            self.status = format!("没有可提交的 AI 改动（共 {total} 条，失效 {stale} 条），未提交");
             return;
         }
-        let source_map = render_html(&self.model).source_map;
-        let Some(span) = source_map.span_for(&p.node) else {
-            self.status = format!("{} 不可编辑，AI 提案作废", p.node.0);
-            return;
-        };
-        let set = PatchSet::new(vec![Patch::ai(
-            "ai-rewrite",
-            Target::Node(p.node.clone()),
-            Op::SetSpan { range: span.range, text: p.new.clone() },
-        )])
-        .approve_ai(); // review 动作：用户刚在对照面板点了「接受」——没有这步 commit 会拒（core 强制）
+        let n = patches.len();
+        // review 动作：用户刚在对照面板勾选并点了「接受」——没有这步 commit 会拒（core 强制）
+        let set = PatchSet::new(patches).approve_ai();
         match commit(&mut self.model, &set) {
             Ok(inverse) => {
                 self.undo_stack.push(inverse);
                 self.rebuild_blocks();
-                self.status = format!("已接受 AI 改写 {}（撤销可回）", p.node.0);
+                let warn = if stale > 0 { format!("；{stale} 条已失效跳过") } else { String::new() };
+                self.status = format!("已接受 {n} 条 AI 改动（一次撤销可整组回）{warn}");
             }
             Err(e) => self.status = format!("AI 提案提交失败: {e:?}"),
         }
     }
 
-    /// 拒绝提案：丢弃，model 一字未动。
+    /// 全部拒绝：整个提案丢弃，model 一字未动。
     fn reject_ai(&mut self) {
         if let Some(p) = self.pending_ai.take() {
-            self.status = format!("已拒绝 {} 的 AI 提案，模型未动", p.node.0);
+            self.status = format!("已拒绝全部 {} 条 AI 提案，模型未动", p.changes.len());
         }
     }
 
@@ -696,26 +727,49 @@ impl eframe::App for PolarisApp {
             });
         });
 
-        // AI review 对照窗：有待审提案时浮出。决策收集后在面板外统一处理（借用纪律）。
+        // AI review 对照窗：有待审提案时浮出，逐条勾选。决策收集后在面板外统一处理（借用纪律）。
         let mut ai_decision: Option<bool> = None;
-        if let Some(p) = &self.pending_ai {
+        // 失效标记先算好（闭包里 self.pending_ai 是可变借用，不能再调 &self 方法）。
+        let change_validity: Vec<bool> = self
+            .pending_ai
+            .as_ref()
+            .map(|p| {
+                p.changes
+                    .iter()
+                    .map(|c| self.model.get_text(&c.node) == Some(c.old.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(p) = &mut self.pending_ai {
             egui::Window::new("AI 改写提案（需 review）")
                 .collapsible(false)
-                .default_width(420.0)
+                .default_width(460.0)
                 .show(ctx, |ui| {
-                    ui.label(format!("目标段落: {}", p.node.0));
-                    ui.separator();
-                    ui.label("旧文:");
-                    ui.label(egui::RichText::new(p.old.as_str()).weak());
-                    ui.separator();
-                    ui.label("新文（AI 建议）:");
-                    ui.label(egui::RichText::new(p.new.as_str()).strong());
+                    ui.label(format!("{} 条改动建议，勾选要接受的：", p.changes.len()));
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for (i, c) in p.changes.iter_mut().enumerate() {
+                            ui.separator();
+                            if change_validity.get(i).copied().unwrap_or(false) {
+                                ui.checkbox(&mut c.selected, c.node.0.as_str());
+                            } else {
+                                c.selected = false;
+                                ui.label(
+                                    egui::RichText::new(format!("{}（已被人改过，失效）", c.node.0))
+                                        .weak()
+                                        .strikethrough(),
+                                );
+                            }
+                            ui.label(egui::RichText::new(c.old.as_str()).weak());
+                            ui.label("→");
+                            ui.label(egui::RichText::new(c.new.as_str()).strong());
+                        }
+                    });
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("✓ 接受").clicked() {
+                        if ui.button("✓ 接受勾选项").clicked() {
                             ai_decision = Some(true);
                         }
-                        if ui.button("✗ 拒绝").clicked() {
+                        if ui.button("✗ 全部拒绝").clicked() {
                             ai_decision = Some(false);
                         }
                     });
@@ -988,15 +1042,28 @@ mod tests {
     // ── Step 17/18：AI patch 回路（真模型在后台线程，测试用伪造的 AiReply 驱动收货口，
     //    不碰 claude 子进程；review→commit→undo 通道与 Step 17 完全相同——「通道一行不改」的验收）──
 
+    /// 测试小工具：装一篇多段文档，返回各段节点 id。
+    fn app_with_paragraphs(texts: &[&str]) -> (PolarisApp, Vec<NodeId>) {
+        let mut app = PolarisApp::new();
+        let blocks = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DocxBlock::Paragraph { text: t.to_string(), para_id: Some(format!("P{i}")) })
+            .collect();
+        app.load_from_backend(&FakeBackend::new(blocks), "x.docx").unwrap();
+        let ids = (0..texts.len()).map(|i| NodeId(format!("docx:{i}"))).collect();
+        (app, ids)
+    }
+
     /// 测试小工具：装一篇单段文档。
     fn app_with_paragraph(text: &str) -> (PolarisApp, NodeId) {
-        let mut app = PolarisApp::new();
-        let backend = FakeBackend::new(vec![DocxBlock::Paragraph {
-            text: text.to_string(),
-            para_id: Some("AA".to_string()),
-        }]);
-        app.load_from_backend(&backend, "x.docx").unwrap();
-        (app, NodeId("docx:0".to_string()))
+        let (app, ids) = app_with_paragraphs(&[text]);
+        (app, ids.into_iter().next().unwrap())
+    }
+
+    /// 测试小工具：伪造一条成功的 AI 回包。
+    fn ok_reply(node: &NodeId, old: &str, new: &str) -> AiReply {
+        AiReply { node: node.clone(), old: old.to_string(), result: Ok(new.to_string()) }
     }
 
     #[test]
@@ -1020,14 +1087,12 @@ mod tests {
     #[test]
     fn ai_reply_becomes_proposal_then_accept_commits_and_undoes() {
         let (mut app, node) = app_with_paragraph("原始段落");
-        app.receive_ai_result(AiReply {
-            node: node.clone(),
-            old: "原始段落".to_string(),
-            result: Ok("更专业的段落。".to_string()),
-        });
+        app.receive_ai_result(ok_reply(&node, "原始段落", "更专业的段落。"));
         let p = app.pending_ai.as_ref().expect("应有待审提案");
-        assert_eq!(p.old, "原始段落");
-        assert_eq!(p.new, "更专业的段落。");
+        assert_eq!(p.changes.len(), 1);
+        assert_eq!(p.changes[0].old, "原始段落");
+        assert_eq!(p.changes[0].new, "更专业的段落。");
+        assert!(p.changes[0].selected); // 默认勾选
         assert_eq!(app.model.get_text(&node), Some("原始段落")); // 提案不碰 model
 
         app.accept_ai(); // = review 放行 + commit（与 Step 17 同一条通道）
@@ -1037,6 +1102,50 @@ mod tests {
 
         app.undo_last();
         assert_eq!(app.model.get_text(&node), Some("原始段落"));
+    }
+
+    #[test]
+    fn multi_change_partial_accept_is_one_atomic_undo_unit() {
+        let (mut app, ids) = app_with_paragraphs(&["甲", "乙", "丙"]);
+        app.receive_ai_result(ok_reply(&ids[0], "甲", "甲改。"));
+        app.receive_ai_result(ok_reply(&ids[1], "乙", "乙改。"));
+        app.receive_ai_result(ok_reply(&ids[2], "丙", "丙改。"));
+        let p = app.pending_ai.as_mut().expect("应有提案");
+        assert_eq!(p.changes.len(), 3);
+        p.changes[1].selected = false; // 取消勾选「乙」
+
+        app.accept_ai();
+        assert_eq!(app.model.get_text(&ids[0]), Some("甲改。"));
+        assert_eq!(app.model.get_text(&ids[1]), Some("乙")); // 未勾 → 没动
+        assert_eq!(app.model.get_text(&ids[2]), Some("丙改。"));
+        assert_eq!(app.undo_stack.len(), 1); // 一组 = 一个撤销单位
+
+        app.undo_last(); // 一次撤销整组回滚
+        assert_eq!(app.model.get_text(&ids[0]), Some("甲"));
+        assert_eq!(app.model.get_text(&ids[2]), Some("丙"));
+    }
+
+    #[test]
+    fn same_node_new_reply_replaces_old_entry() {
+        let (mut app, node) = app_with_paragraph("原文");
+        app.receive_ai_result(ok_reply(&node, "原文", "第一版改写。"));
+        app.receive_ai_result(ok_reply(&node, "原文", "第二版改写。"));
+        let p = app.pending_ai.as_ref().unwrap();
+        assert_eq!(p.changes.len(), 1); // 不堆积
+        assert_eq!(p.changes[0].new, "第二版改写。");
+    }
+
+    #[test]
+    fn stale_change_skipped_on_accept_while_valid_ones_commit() {
+        let (mut app, ids) = app_with_paragraphs(&["甲", "乙"]);
+        app.receive_ai_result(ok_reply(&ids[0], "甲", "甲改。"));
+        app.receive_ai_result(ok_reply(&ids[1], "乙", "乙改。"));
+        app.commit_edit(&ids[0], "人改了甲").unwrap(); // 「甲」那条失效
+
+        app.accept_ai();
+        assert_eq!(app.model.get_text(&ids[0]), Some("人改了甲")); // 失效条没覆盖人改
+        assert_eq!(app.model.get_text(&ids[1]), Some("乙改。")); // 有效条正常提交
+        assert!(app.status.contains("失效"));
     }
 
     #[test]
@@ -1081,7 +1190,8 @@ mod tests {
         app.commit_edit(&node, "人又改了一版。").unwrap();
         app.accept_ai();
         assert_eq!(app.model.get_text(&node), Some("人又改了一版。"));
-        assert!(app.status.contains("作废"));
+        assert!(app.status.contains("失效")); // 失效条被跳过，未提交任何东西
+        assert!(app.status.contains("未提交"));
     }
 
     #[test]
