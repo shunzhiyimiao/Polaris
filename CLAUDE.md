@@ -109,7 +109,16 @@
 - **Step 18 ✅｜真 AI 接入**：把假 AI 源换成真模型调用（方式到这步再定：HTTP API or 子进程，需要新依赖时说明理由）。review 通道一行不改——这是 Step 17 把接口切对的验收。
   *Stop gate：绿，真机：真模型提的 patch 走完 review→commit→undo 全程。*
 
-> Step 18 之后再停下重新规划。**在那之前不要做：conflicts、Issue、Validation、完整 Capability 系统、MCP/对外 agent 接口、多模块（Spreadsheet/Slide/…）。**
+- **Step 19｜多条提案的批量 review 与原子提交（通道扩容，不动 AI 端）**：`AiProposal` 升级为多条 `AiChange { node, old, new }` 列表；review 面板逐条对照 + 勾选（默认全选；某条的段落被人改过 → 该条自动失效不可勾）；「接受勾选项」→ 合成**一个 AI 来源 PatchSet** → `approve_ai` → 一次原子 commit = 一个撤销单位；「全部拒绝」。AI 入口暂仍单段（产出单条列表）。
+  *Stop gate：绿，真机：两条以上提案部分勾选接受，一次撤销整组回滚。*
+
+- **Step 20｜全文 AI 提案（真模型多段）**：工具栏「AI 清理全文」：把全部可编辑段（带节点 id）打包成一个 prompt，要求模型返回 JSON `[{id, new}]` 只含需要改的段；解析后生成多条 `AiChange` 进 Step 19 通道。后台线程同前；大文档先做截断妥协（超 N 段只处理前 N 段并明示）。
+  *Stop gate：绿，真机：真实话术库全文清理（满身 1111/2222 杂质是现成用例），批量 review 后一次提交、一次撤销。*
+
+- **Step 21｜diff 高亮**：review 对照从「两坨全文」升级为词/字级 diff 着色（增/删分色）。diff 用纯函数（自写最小 LCS 或引 `similar`，到时按体量定、引依赖说明理由）。单段与批量 review 共用。
+  *Stop gate：绿，真机：长段落一眼看出改了哪几个词。*
+
+> Step 21 之后再停下重新规划。**在那之前不要做：conflicts、Issue、Validation、完整 Capability 系统、MCP/对外 agent 接口、多模块（Spreadsheet/Slide/…）。**
 
 ---
 
@@ -141,4 +150,4 @@
 
 ## 开始
 
-Step 0–18 已绿，**本阶段阶梯走完**。按章程：停下重新规划下一阶段（候选方向见 backlog 与总纲；不要自行开工）。
+Step 0–18 已绿；GitHub 仓库与 CI 已就绪（push 自动跑全测试）。下一步从 **Step 19（批量 review 通道）** 开始，按交付格式报告，绿了再走 20。
