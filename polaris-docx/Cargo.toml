@@ -1,0 +1,12 @@
+[package]
+name = "polaris-docx"
+version = "0.1.0"
+edition = "2021"
+
+# 只依赖中性内核 + serde_json。
+# serde_json（Step 7b 引入）：OfficeCLI 后端输出 JSON，用它解析比手写 JSON parser 稳健得多。
+[dependencies]
+editor-core = { path = ".." }
+serde_json = "1"
+# base64（Step 16 引入）：officecli `view html` 把图片内嵌为 data URI，解码字节需要它（零依赖小crate）。
+base64 = "0.22"

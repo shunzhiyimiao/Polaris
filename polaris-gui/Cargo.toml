@@ -1,0 +1,17 @@
+[package]
+name = "polaris-gui"
+version = "0.1.0"
+edition = "2021"
+
+# Step 10：原生 GUI（eframe/egui）。重依赖经用户确认；editor-core 保持中性，GUI 只读其公开 API。
+[dependencies]
+editor-core = { path = ".." }
+polaris-docx = { path = "../polaris-docx" }
+eframe = "0.29"
+rfd = "0.14"
+# chrono（版本历史引入）：版本列表要把 epoch 毫秒显示成本地时间，时区换算手写不可靠。
+chrono = "0.4"
+# egui_extras+image（真图显示引入）：egui 贴图需要解码 PNG/JPEG，官方 loader 走 image crate。
+# image 必须显式依赖并开格式 feature——egui_extras 默认不开任何解码格式（feature 合并）。
+egui_extras = { version = "0.29", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

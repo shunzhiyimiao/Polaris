@@ -1,0 +1,16 @@
+[package]
+name = "editor-core"
+version = "0.1.0"
+edition = "2021"
+
+# Step B1: 零依赖，把首次编译的不确定性降到最低。
+# 后续增量加 op / PatchEngine / depends_on 时，若需要 JSON payload 再引 serde。
+[dependencies]
+
+# Step 7a：office（docx）适配层放进独立 crate polaris-docx，editor-core 保持中性。
+[workspace]
+resolver = "2"
+members = ["polaris-docx", "polaris-gui"]
+# 平 `cargo test` 默认只覆盖内核 + 适配层（轻、独立）；
+# GUI（eframe 重依赖）用 `-p polaris-gui` 单独构建/测，避免拖累 core 绿灯。
+default-members = [".", "polaris-docx"]
