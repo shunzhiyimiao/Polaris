@@ -41,6 +41,85 @@ struct AiProposal {
     changes: Vec<AiChange>,
 }
 
+/// diff 的一段（相对 old→new）：相等 / 删除（只在 old）/ 插入（只在 new）。
+#[derive(Clone, Debug, PartialEq)]
+enum DiffPart {
+    Equal(String),
+    Delete(String),
+    Insert(String),
+}
+
+/// 字符级 LCS diff（old → new），相邻同类 char 合并成串便于着色。**纯函数**。
+/// CJK 无词边界，按 char 对齐最稳；段落级长度下 O(n·m) DP 足够快（不引 diff 依赖）。
+fn char_diff(old: &str, new: &str) -> Vec<DiffPart> {
+    let a: Vec<char> = old.chars().collect();
+    let b: Vec<char> = new.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    // dp[i][j] = LCS(a[i..], b[j..]) 的长度
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
+        }
+    }
+    // 相邻同类合并：kind 0=Equal 1=Delete 2=Insert
+    fn push(parts: &mut Vec<DiffPart>, kind: u8, ch: char) {
+        match parts.last_mut() {
+            Some(DiffPart::Equal(s)) if kind == 0 => s.push(ch),
+            Some(DiffPart::Delete(s)) if kind == 1 => s.push(ch),
+            Some(DiffPart::Insert(s)) if kind == 2 => s.push(ch),
+            _ => parts.push(match kind {
+                0 => DiffPart::Equal(ch.to_string()),
+                1 => DiffPart::Delete(ch.to_string()),
+                _ => DiffPart::Insert(ch.to_string()),
+            }),
+        }
+    }
+    // 回溯成编辑序列（差异时删优先于插，保证确定性）
+    let mut parts = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            push(&mut parts, 0, a[i]);
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            push(&mut parts, 1, a[i]);
+            i += 1;
+        } else {
+            push(&mut parts, 2, b[j]);
+            j += 1;
+        }
+    }
+    while i < n {
+        push(&mut parts, 1, a[i]);
+        i += 1;
+    }
+    while j < m {
+        push(&mut parts, 2, b[j]);
+        j += 1;
+    }
+    parts
+}
+
+/// 把一段 diff 渲染成内联着色文本：相等=弱灰、删除=红+删除线、插入=绿+加粗。
+/// 一眼看出改了哪几个字（无空隙拼接，靠颜色而非位置区分）。
+fn show_diff(ui: &mut egui::Ui, parts: &[DiffPart]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for part in parts {
+            let rt = match part {
+                DiffPart::Equal(s) => egui::RichText::new(s).weak(),
+                DiffPart::Delete(s) => {
+                    egui::RichText::new(s).color(egui::Color32::from_rgb(200, 60, 60)).strikethrough()
+                }
+                DiffPart::Insert(s) => egui::RichText::new(s).color(egui::Color32::from_rgb(40, 150, 70)).strong(),
+            };
+            ui.label(rt);
+        }
+    });
+}
+
 /// 一次 AI 请求的种类与快照（发起时的旧文随请求走：收货时用来判断段落是否已被人改过）。
 enum AiRequest {
     /// 单段改写。
@@ -872,9 +951,8 @@ impl eframe::App for PolarisApp {
                                         .strikethrough(),
                                 );
                             }
-                            ui.label(egui::RichText::new(c.old.as_str()).weak());
-                            ui.label("→");
-                            ui.label(egui::RichText::new(c.new.as_str()).strong());
+                            // 字符级 diff 着色：红删绿增，一眼看出改了哪几个字。
+                            show_diff(ui, &char_diff(&c.old, &c.new));
                         }
                     });
                     ui.separator();
@@ -1182,6 +1260,75 @@ mod tests {
         AiReply {
             request: AiRequest::Single { node: node.clone(), old: old.to_string() },
             result: Ok(new.to_string()),
+        }
+    }
+
+    // ── Step 21：字符级 diff（review 对照着色）──
+
+    #[test]
+    fn char_diff_pure_insert_and_delete() {
+        assert_eq!(char_diff("ab", "abc"), vec![DiffPart::Equal("ab".into()), DiffPart::Insert("c".into())]);
+        assert_eq!(char_diff("abc", "ab"), vec![DiffPart::Equal("ab".into()), DiffPart::Delete("c".into())]);
+    }
+
+    #[test]
+    fn char_diff_middle_replace_merges_runs() {
+        // 中段替换：X→Y，前后相等段保留并合并成串
+        assert_eq!(
+            char_diff("abXcd", "abYcd"),
+            vec![
+                DiffPart::Equal("ab".into()),
+                DiffPart::Delete("X".into()),
+                DiffPart::Insert("Y".into()),
+                DiffPart::Equal("cd".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn char_diff_cjk_tail_deletion() {
+        // 真机同形：删尾部杂质 / 删多余称谓，相等前缀整段保留
+        assert_eq!(
+            char_diff("一、开场与破冰11113232", "一、开场与破冰"),
+            vec![DiffPart::Equal("一、开场与破冰".into()), DiffPart::Delete("11113232".into())]
+        );
+        assert_eq!(
+            char_diff("财兔的Ryan小汪老师", "财兔的Ryan"),
+            vec![DiffPart::Equal("财兔的Ryan".into()), DiffPart::Delete("小汪老师".into())]
+        );
+    }
+
+    #[test]
+    fn char_diff_edges_empty_and_identical() {
+        assert_eq!(char_diff("同", "同"), vec![DiffPart::Equal("同".into())]);
+        assert_eq!(char_diff("", "新"), vec![DiffPart::Insert("新".into())]);
+        assert_eq!(char_diff("旧", ""), vec![DiffPart::Delete("旧".into())]);
+        assert!(char_diff("", "").is_empty());
+        // 全不同 → 全删 + 全插（删优先）
+        assert_eq!(char_diff("猫", "狗"), vec![DiffPart::Delete("猫".into()), DiffPart::Insert("狗".into())]);
+    }
+
+    #[test]
+    fn char_diff_reconstructs_both_sides() {
+        // 不变式：Equal+Delete 拼回 old；Equal+Insert 拼回 new
+        for (old, new) in [("财兔的Ryan小汪老师", "财兔的Ryan。"), ("abXcd", "aYcdZ"), ("", "新增"), ("删除", "")] {
+            let parts = char_diff(old, new);
+            let recon_old: String = parts
+                .iter()
+                .filter_map(|p| match p {
+                    DiffPart::Equal(s) | DiffPart::Delete(s) => Some(s.as_str()),
+                    DiffPart::Insert(_) => None,
+                })
+                .collect();
+            let recon_new: String = parts
+                .iter()
+                .filter_map(|p| match p {
+                    DiffPart::Equal(s) | DiffPart::Insert(s) => Some(s.as_str()),
+                    DiffPart::Delete(_) => None,
+                })
+                .collect();
+            assert_eq!(recon_old, old, "old 重建失败: {old:?}→{new:?}");
+            assert_eq!(recon_new, new, "new 重建失败: {old:?}→{new:?}");
         }
     }
 
