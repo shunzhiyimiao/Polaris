@@ -299,6 +299,9 @@ struct PolarisApp {
     para_map: HashMap<NodeId, String>,
     /// 节点 → 真图字节（图片占位块）。Arc 让每帧渲染零拷贝；没有的图片块降级为文字占位。
     image_map: HashMap<NodeId, Arc<[u8]>>,
+    /// 节点 → 「在它之后插入」的 `after:` 锚（段落 `p[@paraId=X]` / 表格 `tbl[N]`）。
+    /// 新增段写回时遍历它推进锚点——表格也算数，故表格后的新段锚到表格后，不退到表格前。
+    body_anchor: HashMap<NodeId, String>,
     loaded_path: Option<String>,
     status: String,
     doc_path: String,
@@ -327,6 +330,7 @@ impl PolarisApp {
             original: HashMap::new(),
             para_map: HashMap::new(),
             image_map: HashMap::new(),
+            body_anchor: HashMap::new(),
             loaded_path: None,
             status: "就绪".to_string(),
             doc_path,
@@ -366,6 +370,12 @@ impl PolarisApp {
                 }
                 _ => None,
             })
+            .collect();
+        // 节点 ↔ after 锚（段落 + 表格都进）：新增段写回时据此推进锚点。
+        self.body_anchor = ids
+            .iter()
+            .zip(&blocks)
+            .filter_map(|(id, b)| b.body_anchor().map(|a| (id.clone(), a)))
             .collect();
         self.model = model;
         self.rebuild_blocks();
@@ -611,9 +621,8 @@ impl PolarisApp {
         let path_of = |node: &NodeId| -> Option<String> {
             self.para_map.get(node).map(|pid| format!("/body/p[@paraId={pid}]"))
         };
-        let after_of = |node: &NodeId| -> Option<String> {
-            self.para_map.get(node).map(|pid| format!("p[@paraId={pid}]"))
-        };
+        // after 锚查 body_anchor：段落 → p[@paraId]，表格 → tbl[N]，故表格也推进锚点。
+        let after_of = |node: &NodeId| -> Option<String> { self.body_anchor.get(node).cloned() };
 
         // 以 **model** 为准（真理之源），不读 UI 缓冲——与 has_unsaved_changes 同一纪律。
         let blocks = document_blocks(&self.model);
@@ -643,8 +652,9 @@ impl PolarisApp {
             }
         }
 
-        // 3) 新增段 → add。锚点 = 前一个**有身份**的原段；无身份块（表格占位）不更新锚点，
-        //    所以紧跟表格后新增的段会落到表格前——内容不丢，位置是已知妥协（见交付说明）。
+        // 3) 新增段 → add。锚点 = 前一个有 after 锚的原块（段落 p[@paraId] 或表格 tbl[N]）。
+        //    表格也推进锚点，故紧跟表格后新增的段锚到表格**后**（tbl[N] 位置式：同批次若删了
+        //    表格前的段会位移，属已知妥协——常见的「表格后加段」单独保存不受影响）。
         let mut anchor: Option<String> = None; // "p[@paraId=X]"；None=追加末尾
         let mut run: Vec<String> = Vec::new();
         for b in &blocks {
@@ -1127,7 +1137,7 @@ mod tests {
         let mut app = PolarisApp::new();
         let backend = FakeBackend::new(vec![
             DocxBlock::Paragraph { text: "前段".to_string(), para_id: Some("AA".to_string()) }, // docx:0
-            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[Table: 1 rows]".to_string(), para_id: None, image: None }, // docx:1
+            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[Table: 1 rows]".to_string(), para_id: None, image: None, anchor: None }, // docx:1
             DocxBlock::Paragraph { text: "后段".to_string(), para_id: Some("CC".to_string()) }, // docx:2
         ]);
         app.load_from_backend(&backend, "x.docx").unwrap();
@@ -1146,16 +1156,59 @@ mod tests {
     }
 
     #[test]
+    fn new_paragraph_after_table_anchors_to_table_not_before_it() {
+        // Step 22（①）：表格带 tbl[N] 锚，新段落紧跟其后 → 锚到 tbl[1]，不退到表格前的段。
+        let mut app = PolarisApp::new();
+        let backend = FakeBackend::new(vec![
+            DocxBlock::Paragraph { text: "前段".to_string(), para_id: Some("AA".to_string()) }, // docx:0
+            DocxBlock::Unstructured {
+                kind: "table".to_string(),
+                raw: "[Table]".to_string(),
+                para_id: None,
+                image: None,
+                anchor: Some("tbl[1]".to_string()),
+            }, // docx:1（表格，after 锚 = tbl[1]）
+        ]);
+        app.load_from_backend(&backend, "x.docx").unwrap();
+        app.add_paragraph(); // 文档末尾（= 表格后）加新段
+
+        let (ops, skipped) = app.pending_ops();
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            ops,
+            vec![DocxOp::Add { after: Some("tbl[1]".to_string()), text: "新段落".to_string() }]
+        );
+    }
+
+    #[test]
+    fn new_paragraph_after_plain_paragraph_still_anchors_to_it() {
+        // 无表格时不回归：新段落锚到前一个段落的 p[@paraId]。
+        let mut app = PolarisApp::new();
+        let backend = FakeBackend::new(vec![DocxBlock::Paragraph {
+            text: "唯一段".to_string(),
+            para_id: Some("AA".to_string()),
+        }]);
+        app.load_from_backend(&backend, "x.docx").unwrap();
+        app.add_paragraph();
+        let (ops, _) = app.pending_ops();
+        assert_eq!(
+            ops,
+            vec![DocxOp::Add { after: Some("p[@paraId=AA]".to_string()), text: "新段落".to_string() }]
+        );
+    }
+
+    #[test]
     fn opaque_blocks_are_readonly_and_delete_gated() {
         let mut app = PolarisApp::new();
         let backend = FakeBackend::new(vec![
             DocxBlock::Paragraph { text: "前段".to_string(), para_id: Some("AA".to_string()) }, // docx:0
-            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None }, // docx:1
+            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None, anchor: None }, // docx:1
             DocxBlock::Unstructured {
                 kind: "image".to_string(),
                 raw: "alt=\"图\"".to_string(),
                 para_id: Some("IMG".to_string()),
                 image: None,
+                anchor: None,
             }, // docx:2
         ]);
         app.load_from_backend(&backend, "x.docx").unwrap();
@@ -1186,6 +1239,7 @@ mod tests {
                 raw: "alt=\"图\"".to_string(),
                 para_id: Some("IMG".to_string()),
                 image: None,
+                anchor: None,
             },
         ]);
         app.load_from_backend(&backend, "x.docx").unwrap();
@@ -1205,12 +1259,14 @@ mod tests {
                 raw: "alt=\"图\"".to_string(),
                 para_id: Some("IMG".to_string()),
                 image: Some(b"PNGBYTES".to_vec()), // 有真图字节 → 进 image_map
+                anchor: None,
             }, // docx:1
             DocxBlock::Unstructured {
                 kind: "image".to_string(),
                 raw: "alt=\"没抽到\"".to_string(),
                 para_id: Some("MISS".to_string()),
                 image: None, // 没字节 → 降级文字占位（不进 map，但块仍在）
+                anchor: None,
             }, // docx:2
         ]);
         app.load_from_backend(&backend, "x.docx").unwrap();
@@ -1562,7 +1618,7 @@ mod tests {
         let mut app = PolarisApp::new();
         let backend = FakeBackend::new(vec![
             DocxBlock::Paragraph { text: "甲".to_string(), para_id: Some("AA".to_string()) },
-            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None },
+            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None, anchor: None },
             DocxBlock::Paragraph { text: "乙".to_string(), para_id: Some("BB".to_string()) },
         ]);
         app.load_from_backend(&backend, "x.docx").unwrap();

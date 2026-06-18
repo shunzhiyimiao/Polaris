@@ -23,7 +23,8 @@ pub enum DocxBlock {
     /// 后端看得见、但还映射不进结构的东西（表格/图/复杂格式）：原样留痕，绝不丢弃。
     /// `para_id`：本体是段落的（如纯图段）带身份 → 可删可写回；体级非段落元素（表格）没有。
     /// `image`：真图字节（从 `view html` 的 data URI 解出）；拿不到 → None，显示降级为文字占位。
-    Unstructured { kind: String, raw: String, para_id: Option<String>, image: Option<Vec<u8>> },
+    /// `anchor`：体级元素的 `after:` 形式路径（如表格 `tbl[1]`），供写回时把新段锚到它之后。
+    Unstructured { kind: String, raw: String, para_id: Option<String>, image: Option<Vec<u8>>, anchor: Option<String> },
 }
 
 impl DocxBlock {
@@ -33,6 +34,19 @@ impl DocxBlock {
             DocxBlock::Heading { para_id, .. }
             | DocxBlock::Paragraph { para_id, .. }
             | DocxBlock::Unstructured { para_id, .. } => para_id.as_deref(),
+        }
+    }
+
+    /// 该块作为「在它之后插入」锚点的 `after:` 形式路径：
+    /// 段落/标题/图片段 → `p[@paraId=X]`（有身份才有）；表格等体级元素 → `tbl[N]`（来自 anchor）。
+    /// 写回新增段时用它定位，使表格也能推进锚点（新段落落到表格**后**而非退到表格前）。
+    pub fn body_anchor(&self) -> Option<String> {
+        if let Some(pid) = self.para_id() {
+            Some(format!("p[@paraId={pid}]"))
+        } else if let DocxBlock::Unstructured { anchor, .. } = self {
+            anchor.clone()
+        } else {
+            None
         }
     }
 }
@@ -320,12 +334,15 @@ fn attach_images(blocks: Vec<DocxBlock>, images: &HashMap<String, Vec<u8>>) -> V
     blocks
         .into_iter()
         .map(|b| match b {
-            DocxBlock::Unstructured { kind, raw, para_id: Some(id), image: None } if images.contains_key(&id) => {
+            DocxBlock::Unstructured { kind, raw, para_id: Some(id), image: None, anchor }
+                if images.contains_key(&id) =>
+            {
                 DocxBlock::Unstructured {
                     kind,
                     raw,
                     image: Some(images[&id].clone()),
                     para_id: Some(id),
+                    anchor,
                 }
             }
             other => other,
@@ -360,12 +377,13 @@ fn apply_image_paras(blocks: Vec<DocxBlock>, images: &[(String, String)]) -> Vec
             DocxBlock::Paragraph { text, para_id: Some(id) }
                 if text.is_empty() && label_of.contains_key(id.as_str()) =>
             {
-                // 本体是段落 → 身份保留：图片段因此可删、删了能按 paraId 写回。
+                // 本体是段落 → 身份保留：图片段因此可删、删了能按 paraId 写回（锚走 para_id，anchor None）。
                 DocxBlock::Unstructured {
                     kind: "image".to_string(),
                     raw: label_of[id.as_str()].to_string(),
                     para_id: Some(id.clone()),
                     image: None,
+                    anchor: None,
                 }
             }
             _ => b,
@@ -411,7 +429,9 @@ fn parse_blocks(text: &Value, outline: &Value) -> Result<Vec<DocxBlock>, String>
             }
         } else {
             // 段落以外的元素（表格/图/…）：原样存成不透明块，绝不丢弃。
-            blocks.push(DocxBlock::Unstructured { kind: typ.to_string(), raw: txt, para_id: None, image: None });
+            // anchor = 体相对路径（`/body/tbl[1]` → `tbl[1]`），供写回把新段锚到它之后。
+            let anchor = path.strip_prefix("/body/").map(str::to_string);
+            blocks.push(DocxBlock::Unstructured { kind: typ.to_string(), raw: txt, para_id: None, image: None, anchor });
         }
     }
     Ok(blocks)
@@ -452,7 +472,7 @@ mod tests {
     fn unstructured_is_visible_not_dropped() {
         let m = import(vec![
             DocxBlock::Heading { level: 2, text: "Sec".to_string(), para_id: None },
-            DocxBlock::Unstructured { kind: "table".to_string(), raw: "A | B".to_string(), para_id: None, image: None },
+            DocxBlock::Unstructured { kind: "table".to_string(), raw: "A | B".to_string(), para_id: None, image: None, anchor: None },
             DocxBlock::Paragraph { text: "after".to_string(), para_id: None },
         ]);
         // 映射不进 → typed Opaque 节点（不是文本前缀 hack），文本=原始描述
@@ -532,7 +552,7 @@ mod tests {
                 DocxBlock::Heading { level: 2, text: "一、节".to_string(), para_id: None },
                 DocxBlock::Paragraph { text: "body text".to_string(), para_id: None },
                 DocxBlock::Paragraph { text: "".to_string(), para_id: None },
-                DocxBlock::Unstructured { kind: "table".to_string(), raw: "r1c1 r1c2".to_string(), para_id: None, image: None },
+                DocxBlock::Unstructured { kind: "table".to_string(), raw: "r1c1 r1c2".to_string(), para_id: None, image: None, anchor: Some("tbl[1]".to_string()) },
             ]
         );
     }
@@ -559,11 +579,15 @@ mod tests {
             vec![
                 DocxBlock::Heading { level: 1, text: "总标题".to_string(), para_id: Some("AA".to_string()) },
                 DocxBlock::Paragraph { text: "前段".to_string(), para_id: Some("BB".to_string()) },
-                DocxBlock::Unstructured { kind: "table".to_string(), raw: "[Table: 1 rows]".to_string(), para_id: None, image: None },
+                // 表格的 after 锚从 path 取：`/body/tbl[1]` → `tbl[1]`（Step 22 ①）
+                DocxBlock::Unstructured { kind: "table".to_string(), raw: "[Table: 1 rows]".to_string(), para_id: None, image: None, anchor: Some("tbl[1]".to_string()) },
                 DocxBlock::Heading { level: 2, text: "表格后的节标题".to_string(), para_id: Some("CC".to_string()) },
                 DocxBlock::Paragraph { text: "后段".to_string(), para_id: Some("DD".to_string()) },
             ]
         );
+        // body_anchor()：段落给 p[@paraId]、表格给 tbl[N]
+        assert_eq!(blocks[1].body_anchor(), Some("p[@paraId=BB]".to_string()));
+        assert_eq!(blocks[2].body_anchor(), Some("tbl[1]".to_string()));
     }
 
     #[test]
@@ -623,7 +647,8 @@ mod tests {
                 kind: "image".to_string(),
                 raw: "alt=\"图\", 1cm×1cm".to_string(),
                 para_id: Some("IMG1".to_string()),
-                image: None
+                image: None,
+                anchor: None,
             }
         );
         assert_eq!(out[2], DocxBlock::Paragraph { text: "".to_string(), para_id: Some("EMPTY".to_string()) });
@@ -693,15 +718,17 @@ mod tests {
                 raw: "alt".to_string(),
                 para_id: Some("IMG".to_string()),
                 image: None,
+                anchor: None,
             },
             // 表格：无身份 → 不装
-            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None },
+            DocxBlock::Unstructured { kind: "table".to_string(), raw: "[T]".to_string(), para_id: None, image: None, anchor: None },
             // 配不上的图片段 → 保持 None（降级为文字占位）
             DocxBlock::Unstructured {
                 kind: "image".to_string(),
                 raw: "alt2".to_string(),
                 para_id: Some("MISSING".to_string()),
                 image: None,
+                anchor: None,
             },
         ];
         let out = attach_images(blocks, &map);

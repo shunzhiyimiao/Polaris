@@ -51,7 +51,7 @@
 
 ---
 
-## 当前状态（Step 0–21 已完成 ✅，104 测试全绿）
+## 当前状态（Step 0–22 已完成 ✅，106 测试全绿）
 
 **端到端回路已闭合**：打开真实 docx → 看见（标题/段落/表格占位/**真图**）→ 改（typed patch + 撤销；不透明内容 core 层只读）→ 按身份写回原文件 → 每次落盘自动留底、可回任意旧版。
 
@@ -79,11 +79,11 @@
 
 - `egui_extras` 的 `image` feature 只装 loader **不开解码格式**——必须直接依赖 `image` crate 并显式开 `png`/`jpeg`（feature 合并），否则图片永远停在加载态。
 - `Image` 默认 fit 同时受可用宽**和高**约束：在 `horizontal` 行里会被按钮列行高压成缩略图——用 `fit_to_exact_size(vec2(宽, INFINITY))`。
-- AccessKit 可按控件名点按钮/读文本（`text area`=多行、`text field`=单行、`static text`=Label），但**图片控件不上报**、键盘事件注入不进 egui；验证图片渲染用「相邻行距几何」或临时 stdout 探针。
+- AccessKit 可按控件名点按钮/读文本（`text area`=多行、`text field`=单行、`static text`=Label），但**图片控件不上报**、键盘事件注入不进 egui（Page Up 仅微动）；验证图片渲染用「相邻行距几何」或临时 stdout 探针。
+- eframe 把窗口/滚动状态持久化到 `$HOME/Library`：真 HOME 下重开会**恢复上次滚动位置**（想从顶部打开用沙箱 HOME 或清 Library）。
 
 ### 已知薄点（backlog，按需捞）
 
-- 紧跟表格后新增段落会落到表格**前**（锚点退化到前一个有身份的段）。
 - 无 paraId 的文件（Pandoc/textutil 产物）：能看不能存（保存时大声报「无法写回」）。要支持得做位置路径写回。
 - 图文混排段（文字+图同段）：文字可编辑，但图的存在看不出来。
 - 旧重复版本不回收；版本文件名是毫秒数，Finder 里人读不出（GUI 面板里有本地时间）。
@@ -118,7 +118,23 @@
 - **Step 21 ✅｜diff 高亮**：review 对照从「两坨全文」升级为词/字级 diff 着色（增/删分色）。diff 用纯函数（自写最小 LCS 或引 `similar`，到时按体量定、引依赖说明理由）。单段与批量 review 共用。
   *Stop gate：绿，真机：长段落一眼看出改了哪几个词。*
 
-> Step 21 之后再停下重新规划。**在那之前不要做：conflicts、Issue、Validation、完整 Capability 系统、MCP/对外 agent 接口、多模块（Spreadsheet/Slide/…）。**
+### B 阶段（backlog 结实化，Step 22–25；选定 2026-06-19，先稳后险）
+
+探针定锚（开工前实测 officecli）：① `add after tbl[1]` **支持**，新段精准落表格后（但 `tbl[N]` 位置式，同批次删表格前的段会位移→记为妥协）；② officecli 对无-paraId 文件**合成显示 id、XML 实无**，位置 set 行为隔 mojibake 难证→最深，殿后。
+
+- **Step 22 ✅｜① 表格后插段锚点**：`DocxBlock::Unstructured` 带 `anchor`（表格的 `tbl[N]` 后缀路径，从 element path 取）；GUI 建 `body_anchor`（节点→`after:` 形式锚，含段落 `p[@paraId]` 与表格 `tbl[N]`）；`pending_ops` 新增段的锚点遍历改查 `body_anchor`，表格也推进锚点 → 表格后新段落锚到 `tbl[N]` 而非退到表格前。
+  *Stop gate：绿，真机：表格后加段、保存，落在表格后。*
+
+- **Step 23｜③ 图文混排段：图的存在可见**：annotated 解析已能识别含图段；对**有文字又有图**的段（非纯图段），在文字后附可见标记（如 `🖼`/`[含图]`），文字仍可编辑。纯展示，不碰写回。
+  *Stop gate：绿，真机：图文混排段能看出「这里有图」，文字照常可编辑。*
+
+- **Step 24｜④ 版本历史回收**：`snapshot` 后按文件保留最近 N 个版本（默认上限，超出删最老），纯 `std::fs`、纯函数可测。回版前留底逻辑不变。
+  *Stop gate：绿，单测：超上限删最老、不误删他者、回版仍可用。*
+
+- **Step 25｜② 无 paraId 文件写回（最深，先再探后定方案）**：候选——load 时检出无-paraId 文件 → 做一次 officecli「规范化」往返让其落 paraId，再重载用稳定 id 写回；或位置路径写回。**开工前必须先实测 officecli 真实行为**（合成 id vs 真 id、位置 set 是否落盘），方案到时定，可能改阶梯或暂缓。
+  *Stop gate：绿，真机：Pandoc/textutil 文件能改能存，原件未结构化部分不丢。*
+
+> Step 25 之后再停下重新规划。**在那之前不要做：conflicts、Issue、Validation、完整 Capability 系统、MCP/对外 agent 接口、多模块（Spreadsheet/Slide/…）。**
 
 ---
 
