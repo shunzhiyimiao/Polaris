@@ -360,9 +360,11 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// 把**纯图段**（自身无文字、但含图片的段）升级为可见的 Unstructured 占位——否则它是空段，
-/// 会被显示层隐藏，图片就「消失」了（违反「全部可见」）。带文字的图文混排段保持原样（文字仍可编辑）。
-/// 真图字节由 `attach_images` 随后装入；这里先 None（拿不到图时它就是最终形态=文字占位）。
+/// 让含图的段「图可见」（违反「全部可见」即 bug）。两种情形：
+/// - **纯图段**（自身无文字）：整段升级为可见 Opaque 图片块（保留身份 → 可删、可装真图）。
+/// - **图文混排段**（有文字 + 有图）：文字段**原样保留**（仍可编辑），其后插一个**只读图片标记块**
+///   （`para_id: None` → 不可删、不可写回，纯展示「这里有图」）——复用 Opaque 渲染，GUI 零改动。
+/// 真图字节由 `attach_images` 随后按 para_id 装入纯图段；混排标记块无身份，只显示文字标注。
 fn apply_image_paras(blocks: Vec<DocxBlock>, images: &[(String, String)]) -> Vec<DocxBlock> {
     let label_of: HashMap<&str, &str> = {
         let mut m = HashMap::new();
@@ -371,24 +373,48 @@ fn apply_image_paras(blocks: Vec<DocxBlock>, images: &[(String, String)]) -> Vec
         }
         m
     };
-    blocks
-        .into_iter()
-        .map(|b| match &b {
-            DocxBlock::Paragraph { text, para_id: Some(id) }
-                if text.is_empty() && label_of.contains_key(id.as_str()) =>
-            {
-                // 本体是段落 → 身份保留：图片段因此可删、删了能按 paraId 写回（锚走 para_id，anchor None）。
-                DocxBlock::Unstructured {
-                    kind: "image".to_string(),
-                    raw: label_of[id.as_str()].to_string(),
-                    para_id: Some(id.clone()),
-                    image: None,
-                    anchor: None,
+    let mut out = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        // 纯图空段 → 升级为带身份的 Opaque 图片块
+        if let DocxBlock::Paragraph { text, para_id: Some(id) } = &b {
+            if text.is_empty() {
+                if let Some(label) = label_of.get(id.as_str()) {
+                    out.push(DocxBlock::Unstructured {
+                        kind: "image".to_string(),
+                        raw: label.to_string(),
+                        para_id: Some(id.clone()),
+                        image: None,
+                        anchor: None,
+                    });
+                    continue;
                 }
             }
-            _ => b,
-        })
-        .collect()
+        }
+        // 图文混排段（标题/段落，有文字且含图）→ 原块 + 只读图片标记块
+        let mixed_label = match &b {
+            DocxBlock::Paragraph { text, para_id: Some(id) }
+            | DocxBlock::Heading { text, para_id: Some(id), .. }
+                if !text.is_empty() =>
+            {
+                label_of.get(id.as_str()).copied()
+            }
+            _ => None,
+        };
+        match mixed_label {
+            Some(label) => {
+                out.push(b);
+                out.push(DocxBlock::Unstructured {
+                    kind: "image".to_string(),
+                    raw: format!("🖼 含图：{label}"),
+                    para_id: None, // 无身份 → 只读、不可删，纯展示
+                    image: None,
+                    anchor: None,
+                });
+            }
+            None => out.push(b),
+        }
+    }
+    out
 }
 
 /// 合并 `text --json`（元素序列，文档序）与 `outline --json`（标题→级别）成 DocxBlock 序列。
@@ -631,28 +657,66 @@ mod tests {
     }
 
     #[test]
-    fn apply_image_paras_makes_pure_image_paragraph_visible() {
-        let images = vec![("IMG1".to_string(), "alt=\"图\", 1cm×1cm".to_string())];
+    fn apply_image_paras_pure_image_para_upgraded_others_untouched() {
+        let images = vec![("PURE".to_string(), "alt=\"图\", 1cm×1cm".to_string())];
         let blocks = vec![
-            DocxBlock::Paragraph { text: "有字".to_string(), para_id: Some("IMG1".to_string()) }, // 图文混排：不动
-            DocxBlock::Paragraph { text: "".to_string(), para_id: Some("IMG1".to_string()) },     // 纯图段：升级
-            DocxBlock::Paragraph { text: "".to_string(), para_id: Some("EMPTY".to_string()) },    // 普通空段：不动
-            DocxBlock::Paragraph { text: "".to_string(), para_id: None },                          // 无身份空段：不动
+            DocxBlock::Paragraph { text: "".to_string(), para_id: Some("PURE".to_string()) },  // 纯图段：升级
+            DocxBlock::Paragraph { text: "".to_string(), para_id: Some("EMPTY".to_string()) }, // 普通空段：不动
+            DocxBlock::Paragraph { text: "".to_string(), para_id: None },                       // 无身份空段：不动
         ];
         let out = apply_image_paras(blocks, &images);
-        assert_eq!(out[0], DocxBlock::Paragraph { text: "有字".to_string(), para_id: Some("IMG1".to_string()) });
+        assert_eq!(out.len(), 3); // 无混排 → 不增块
         assert_eq!(
-            out[1],
+            out[0],
             DocxBlock::Unstructured {
                 kind: "image".to_string(),
                 raw: "alt=\"图\", 1cm×1cm".to_string(),
-                para_id: Some("IMG1".to_string()),
+                para_id: Some("PURE".to_string()), // 保留身份 → 可删、可装真图
                 image: None,
                 anchor: None,
             }
         );
-        assert_eq!(out[2], DocxBlock::Paragraph { text: "".to_string(), para_id: Some("EMPTY".to_string()) });
-        assert_eq!(out[3], DocxBlock::Paragraph { text: "".to_string(), para_id: None });
+        assert_eq!(out[1], DocxBlock::Paragraph { text: "".to_string(), para_id: Some("EMPTY".to_string()) });
+        assert_eq!(out[2], DocxBlock::Paragraph { text: "".to_string(), para_id: None });
+    }
+
+    #[test]
+    fn apply_image_paras_mixed_para_keeps_text_and_appends_readonly_marker() {
+        // Step 23（③）：图文混排段——文字段原样保留（可编辑），其后插只读图片标记块（无身份）。
+        let images = vec![("MIX".to_string(), "alt=\"流程图\"".to_string())];
+        let blocks = vec![
+            DocxBlock::Paragraph { text: "见下图说明".to_string(), para_id: Some("MIX".to_string()) },
+            DocxBlock::Paragraph { text: "无关段".to_string(), para_id: Some("OTHER".to_string()) },
+        ];
+        let out = apply_image_paras(blocks, &images);
+        assert_eq!(out.len(), 3); // 混排段裂成两块
+        // 文字段原样保留（仍是可编辑 Paragraph、身份不变）
+        assert_eq!(out[0], DocxBlock::Paragraph { text: "见下图说明".to_string(), para_id: Some("MIX".to_string()) });
+        // 紧随其后的只读标记块：无身份（不可删/不可写回）、文字含「含图」+ 标注
+        assert_eq!(
+            out[1],
+            DocxBlock::Unstructured {
+                kind: "image".to_string(),
+                raw: "🖼 含图：alt=\"流程图\"".to_string(),
+                para_id: None,
+                image: None,
+                anchor: None,
+            }
+        );
+        assert_eq!(out[2], DocxBlock::Paragraph { text: "无关段".to_string(), para_id: Some("OTHER".to_string()) });
+    }
+
+    #[test]
+    fn apply_image_paras_mixed_heading_also_marked() {
+        // 标题含图也标记（同混排逻辑），标题本身仍是可编辑 Heading
+        let images = vec![("H".to_string(), "alt=\"logo\"".to_string())];
+        let out = apply_image_paras(
+            vec![DocxBlock::Heading { level: 1, text: "带图标题".to_string(), para_id: Some("H".to_string()) }],
+            &images,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], DocxBlock::Heading { level: 1, text: "带图标题".to_string(), para_id: Some("H".to_string()) });
+        assert!(matches!(&out[1], DocxBlock::Unstructured { para_id: None, raw, .. } if raw.contains("含图")));
     }
 
     #[test]
@@ -674,6 +738,25 @@ mod tests {
             r.html,
             "<p data-node=\"docx:0\">前</p><pre data-node=\"docx:1\">alt=\"产品图\"</pre><p data-node=\"docx:2\">后</p>"
         );
+    }
+
+    #[test]
+    fn mixed_image_para_renders_editable_text_plus_readonly_marker() {
+        // 端到端：混排段 → 可编辑 <p>（有 SourceMap 片段）+ 只读 <pre> 标记（无片段）
+        let blocks = apply_image_paras(
+            vec![DocxBlock::Paragraph { text: "见下图".to_string(), para_id: Some("MIX".to_string()) }],
+            &[("MIX".to_string(), "alt=\"图\"".to_string())],
+        );
+        let mut m = ProseModel::new();
+        import_blocks(&mut m, &blocks).unwrap();
+        let r = render_html(&m);
+        assert_eq!(
+            r.html,
+            "<p data-node=\"docx:0\">见下图</p><pre data-node=\"docx:1\">🖼 含图：alt=\"图\"</pre>"
+        );
+        // 文字段可编辑（有片段），标记块只读（无片段）
+        assert!(r.source_map.span_for(&NodeId("docx:0".to_string())).is_some());
+        assert!(r.source_map.span_for(&NodeId("docx:1".to_string())).is_none());
     }
 
     // ── Step 16：真图字节（html data URI 抽取 → 按文档序配对 → 装块）──

@@ -889,7 +889,7 @@ impl eframe::App for PolarisApp {
                                         .desired_width(f32::INFINITY),
                                 )
                             }
-                            // Opaque 只读：有真图字节给真图，没有降级为文字占位。
+                            // Opaque 只读：有真图字节给真图，没有降级为文字占位（含图混排标记走这条）。
                             // 都不可输入、没有失焦提交路径（core 层也会拒：NoSpan）。
                             NodeKind::Opaque => match self.image_map.get(&block.node) {
                                 Some(bytes) => ui.add(
