@@ -388,11 +388,29 @@ impl PolarisApp {
     }
 
     /// 用 OfficeCLI 后端打开某路径并更新状态栏（文件选择器 / 路径栏都走这里）。
+    /// 无-paraId 文件（Pandoc/textutil 产物）先**规范化**：留底原件 → 盖 paraId → 再重载，
+    /// 之后一切走稳定的身份写回路径（一次性、幂等：再开时已有 paraId 就不重复规范化）。
     fn open_path(&mut self, path: &str) {
         let backend = OfficeCliBackend::new();
+        let note = self.normalize_if_needed(&backend, path);
         match self.load_from_backend(&backend, path) {
-            Ok(()) => self.status = format!("已打开 {}（{} 块）", path, self.blocks.len()),
+            Ok(()) => self.status = format!("已打开 {}（{} 块）{note}", path, self.blocks.len()),
             Err(e) => self.status = format!("打开失败: {e}"),
+        }
+    }
+
+    /// 若 `path` 是无-paraId 文件：先把原件留底进历史，再盖 paraId（就地改）。返回状态提示串。
+    /// 任何一步失败都不致命——降级为「照旧打开、编辑写不回」，与老行为一致。
+    fn normalize_if_needed(&self, backend: &OfficeCliBackend, path: &str) -> String {
+        if !backend.lacks_para_ids(path).unwrap_or(false) {
+            return String::new();
+        }
+        // 盖 paraId 会就地改文件：先留底原件（补偿这个外部 effect）。
+        let _ = history::snapshot_if_new(Path::new(path));
+        match backend.stamp_para_ids(path) {
+            Ok(true) => "（已补 paraId 以支持编辑，原件已入历史）".to_string(),
+            Ok(false) => String::new(), // 无非空段落，没什么可编辑的
+            Err(e) => format!("（补 paraId 失败，编辑将无法写回：{e}）"),
         }
     }
 

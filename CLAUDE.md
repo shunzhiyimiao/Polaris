@@ -51,7 +51,7 @@
 
 ---
 
-## 当前状态（Step 0–24 已完成 ✅，114 测试全绿）
+## 当前状态（Step 0–25 已完成 ✅，116 测试全绿）
 
 **端到端回路已闭合**：打开真实 docx → 看见（标题/段落/表格占位/**真图**）→ 改（typed patch + 撤销；不透明内容 core 层只读）→ 按身份写回原文件 → 每次落盘自动留底、可回任意旧版。
 
@@ -67,6 +67,8 @@
 - `html --json` 返回 `{"success":…, "data":"<html…>"}`，data 即 HTML 字符串；真图以 `data:image/png;base64,…` 内嵌（字节与 `word/media/` 原图一致），`<img>` 为文档序。
 - `view` 会留常驻进程，之后 `batch` 会复用导致不落盘——**view 完必须 `close`**。
 - `batch` 部分失败也 exit 0，要靠输出里 `Batch complete … 0 failed` 判断。
+- **一次 batch 存盘就给无-paraId 文件盖上真 `w14:paraId`**（连 find=replace 的自替换也触发）；无-paraId 文件 path 是位置式 `/body/p[N]`，位置 set 能改对落盘。→ 无-paraId 文件规范化 = 开时自替换一次即可。
+- 注意 `grep -c w14:paraId` 数的是**行**不是匹配（document.xml 单行）；数出现次数要 `grep -o … | wc -l`。
 
 ### claude CLI 实测事实（AI 源定锚用）
 
@@ -84,7 +86,6 @@
 
 ### 已知薄点（backlog，按需捞）
 
-- 无 paraId 的文件（Pandoc/textutil 产物）：能看不能存（保存时大声报「无法写回」）。要支持得做位置路径写回。
 - 版本文件名是毫秒数，Finder 里人读不出（GUI 面板里有本地时间）。
 
 ---
@@ -130,10 +131,10 @@
 - **Step 24 ✅｜④ 版本历史回收**：`snapshot` 后按文件保留最近 N 个版本（默认上限，超出删最老），纯 `std::fs`、纯函数可测。回版前留底逻辑不变。
   *Stop gate：绿，单测：超上限删最老、不误删他者、回版仍可用。*
 
-- **Step 25｜② 无 paraId 文件写回（最深，先再探后定方案）**：候选——load 时检出无-paraId 文件 → 做一次 officecli「规范化」往返让其落 paraId，再重载用稳定 id 写回；或位置路径写回。**开工前必须先实测 officecli 真实行为**（合成 id vs 真 id、位置 set 是否落盘），方案到时定，可能改阶梯或暂缓。
+- **Step 25 ✅｜② 无 paraId 文件写回（normalize-on-open）**：候选——load 时检出无-paraId 文件 → 做一次 officecli「规范化」往返让其落 paraId，再重载用稳定 id 写回；或位置路径写回。**开工前必须先实测 officecli 真实行为**（合成 id vs 真 id、位置 set 是否落盘），方案到时定，可能改阶梯或暂缓。
   *Stop gate：绿，真机：Pandoc/textutil 文件能改能存，原件未结构化部分不丢。*
 
-> Step 25 之后再停下重新规划。**在那之前不要做：conflicts、Issue、Validation、完整 Capability 系统、MCP/对外 agent 接口、多模块（Spreadsheet/Slide/…）。**
+> **B 阶段（backlog 结实化 Step 22–25）已全部完成。** 停下重新规划下一阶段。**在那之前不要做：conflicts、Issue、Validation、完整 Capability 系统、MCP/对外 agent 接口、多模块（Spreadsheet/Slide/…）。**
 
 ---
 

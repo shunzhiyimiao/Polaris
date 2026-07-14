@@ -185,7 +185,56 @@ impl OfficeCliBackend {
         Ok(())
     }
 
+
+    /// 无-paraId 文件（Pandoc/textutil 产物）检测：读 `text --json` 看首个段落的 path。
+    /// 有段落且首段 path 不含 `@paraId=` → 缺（返回 true）。无段落 → false。
+    pub fn lacks_para_ids(&self, file: &str) -> Result<bool, String> {
+        let text = self.run_json(file, "text")?;
+        let _ = Command::new(&self.program).args(["close", file]).output();
+        Ok(text_lacks_para_ids(&text))
+    }
+
+    /// 给无-paraId 文件盖上 paraId：对首个**非空**段落做一次自替换 batch（find=replace，内容不变）——
+    /// officecli 存盘时给每个段落盖 `w14:paraId`（实测）。之后该文件即可走稳定的身份写回。
+    /// 返回是否真盖了（无非空段落 → 无操作，false）。**就地改 `file`**。
+    pub fn stamp_para_ids(&self, file: &str) -> Result<bool, String> {
+        let text = self.run_json(file, "text")?;
+        let _ = Command::new(&self.program).args(["close", file]).output();
+        let Some((path, txt)) = first_nonempty_para(&text) else { return Ok(false) };
+        self.save_ops(file, &[DocxOp::Set { path, find: txt.clone(), replace: txt }])?;
+        Ok(true)
+    }
 }
+
+/// 首个段落是否缺 paraId（path 位置式而非 `@paraId=`）。无段落 → false。**纯函数**。
+fn text_lacks_para_ids(text: &Value) -> bool {
+    let Some(elements) = text.pointer("/data/elements").and_then(Value::as_array) else {
+        return false;
+    };
+    for el in elements {
+        if el.get("type").and_then(Value::as_str) == Some("paragraph") {
+            let path = el.get("path").and_then(Value::as_str).unwrap_or("");
+            return !path.contains("@paraId=");
+        }
+    }
+    false
+}
+
+/// 首个**非空**段落的 (positional path, text)——自替换盖 paraId 用。**纯函数**。
+fn first_nonempty_para(text: &Value) -> Option<(String, String)> {
+    let elements = text.pointer("/data/elements").and_then(Value::as_array)?;
+    for el in elements {
+        if el.get("type").and_then(Value::as_str) == Some("paragraph") {
+            let txt = el.get("text").and_then(Value::as_str).unwrap_or("");
+            if !txt.is_empty() {
+                let path = el.get("path").and_then(Value::as_str)?;
+                return Some((path.to_string(), txt.to_string()));
+            }
+        }
+    }
+    None
+}
+
 impl Default for OfficeCliBackend {
     fn default() -> Self {
         Self::new()
@@ -635,6 +684,45 @@ mod tests {
     fn parse_blocks_missing_elements_errors_not_panics() {
         let bad = serde_json::json!({ "success": false });
         assert!(parse_blocks(&bad, &bad).is_err());
+    }
+
+    // ── Step 25：无 paraId 文件检测（规范化前的判定，纯函数；officecli 流程真机验证）──
+
+    #[test]
+    fn text_lacks_para_ids_detects_positional_paths() {
+        // 无-paraId 文件：path 位置式 → 缺
+        let positional = serde_json::json!({"data":{"elements":[
+            {"path":"/body/p[1]","type":"paragraph","text":"标题甲"},
+            {"path":"/body/p[2]","type":"paragraph","text":"正文"}
+        ]}});
+        assert!(text_lacks_para_ids(&positional));
+        // 有 paraId 文件：首段 path 含 @paraId → 不缺
+        let identified = serde_json::json!({"data":{"elements":[
+            {"path":"/body/p[@paraId=AA]","type":"paragraph","text":"标题甲"}
+        ]}});
+        assert!(!text_lacks_para_ids(&identified));
+        // 无段落 → false（无所谓）
+        let empty = serde_json::json!({"data":{"elements":[]}});
+        assert!(!text_lacks_para_ids(&empty));
+    }
+
+    #[test]
+    fn first_nonempty_para_skips_empties_and_nonparagraphs() {
+        let text = serde_json::json!({"data":{"elements":[
+            {"path":"/body/tbl[1]","type":"table","text":"忽略表格"},
+            {"path":"/body/p[1]","type":"paragraph","text":""},
+            {"path":"/body/p[2]","type":"paragraph","text":"第一段非空"},
+            {"path":"/body/p[3]","type":"paragraph","text":"第二段"}
+        ]}});
+        assert_eq!(
+            first_nonempty_para(&text),
+            Some(("/body/p[2]".to_string(), "第一段非空".to_string()))
+        );
+        // 全空/无段落 → None
+        let none = serde_json::json!({"data":{"elements":[
+            {"path":"/body/p[1]","type":"paragraph","text":""}
+        ]}});
+        assert_eq!(first_nonempty_para(&none), None);
     }
 
     // ── 图片可见性（annotated view 解析；fixture 取自真实 officecli 输出）──
